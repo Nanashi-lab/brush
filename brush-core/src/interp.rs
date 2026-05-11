@@ -457,9 +457,14 @@ async fn spawn_pipeline_processes(
     // command.
     if pipeline_len > 1 {
         for _ in 0..(pipeline_len - 1) {
-            let (reader, writer) = std::io::pipe()?;
-            pipe_readers.push(Some(reader.into()));
-            pipe_writers.push(Some(writer.into()));
+            let (reader, writer) = if shell.external_command_runtime().is_some() {
+                openfiles::memory_pipe()
+            } else {
+                let (reader, writer) = std::io::pipe()?;
+                (reader.into(), writer.into())
+            };
+            pipe_readers.push(Some(reader));
+            pipe_writers.push(Some(writer));
         }
         // Push `None` to the readers; it will be popped off by the *first* command, which will
         // mean that command gets its stdin from the execution parameters' current stdin.
@@ -1660,9 +1665,10 @@ pub(crate) async fn setup_redirect(
                         shell.absolute_path(Path::new(expanded_fields.remove(0).as_str()));
 
                     let default_fd_if_unspecified = get_default_fd_for_redirect_kind(kind);
-                    match kind {
+                    let redirection_mode = match kind {
                         ast::IoFileRedirectKind::Read => {
                             options.read(true);
+                            commands::RedirectionOpenMode::Read
                         }
                         ast::IoFileRedirectKind::Write => {
                             if shell
@@ -1682,40 +1688,45 @@ pub(crate) async fn setup_redirect(
                                 options.write(true);
                                 options.truncate(true);
                             }
+                            commands::RedirectionOpenMode::WriteTruncate
                         }
                         ast::IoFileRedirectKind::Append => {
                             options.create(true);
                             options.append(true);
+                            commands::RedirectionOpenMode::WriteAppend
                         }
                         ast::IoFileRedirectKind::ReadAndWrite => {
                             options.create(true);
                             options.read(true);
                             options.write(true);
+                            commands::RedirectionOpenMode::ReadWrite
                         }
                         ast::IoFileRedirectKind::Clobber => {
                             options.create(true);
                             options.write(true);
                             options.truncate(true);
+                            commands::RedirectionOpenMode::WriteTruncate
                         }
                         ast::IoFileRedirectKind::DuplicateInput => {
                             options.read(true);
+                            commands::RedirectionOpenMode::Read
                         }
                         ast::IoFileRedirectKind::DuplicateOutput => {
                             options.create(true);
                             options.write(true);
+                            commands::RedirectionOpenMode::WriteTruncate
                         }
-                    }
+                    };
 
                     let fd_num = specified_fd_num.unwrap_or(default_fd_if_unspecified);
 
-                    let opened_file = shell
-                        .open_file(&options, &expanded_file_path, params)
-                        .map_err(|err| {
-                            error::ErrorKind::RedirectionFailure(
-                                expanded_file_path.to_string_lossy().to_string(),
-                                err.to_string(),
-                            )
-                        })?;
+                    let opened_file = open_redirection_file(
+                        shell,
+                        params,
+                        &options,
+                        &expanded_file_path,
+                        redirection_mode,
+                    )?;
 
                     params.open_files.set_fd(fd_num, opened_file);
                 }
@@ -1881,14 +1892,12 @@ fn setup_redirect_output_and_error_to(
         .truncate(!append)
         .append(append);
 
-    let stdout_file = shell
-        .open_file(&file_options, &abs_file_path, params)
-        .map_err(|err| {
-            error::ErrorKind::RedirectionFailure(
-                abs_file_path.to_string_lossy().to_string(),
-                err.to_string(),
-            )
-        })?;
+    let mode = if append {
+        commands::RedirectionOpenMode::WriteAppend
+    } else {
+        commands::RedirectionOpenMode::WriteTruncate
+    };
+    let stdout_file = open_redirection_file(shell, params, &file_options, &abs_file_path, mode)?;
 
     let stderr_file = stdout_file.try_clone()?;
 
@@ -1896,6 +1905,31 @@ fn setup_redirect_output_and_error_to(
     params.open_files.set_fd(OpenFiles::STDERR_FD, stderr_file);
 
     Ok(())
+}
+
+fn open_redirection_file(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    options: &std::fs::OpenOptions,
+    path: &Path,
+    mode: commands::RedirectionOpenMode,
+) -> Result<OpenFile, error::Error> {
+    if let Some(runtime) = shell.redirection_runtime() {
+        return runtime
+            .open_redirection(shell, params, path, mode)
+            .map_err(|err| {
+                error::ErrorKind::RedirectionFailure(
+                    path.to_string_lossy().to_string(),
+                    err.to_string(),
+                )
+                .into()
+            });
+    }
+
+    shell.open_file(options, path, params).map_err(|err| {
+        error::ErrorKind::RedirectionFailure(path.to_string_lossy().to_string(), err.to_string())
+            .into()
+    })
 }
 
 const fn get_default_fd_for_redirect_kind(kind: &ast::IoFileRedirectKind) -> ShellFd {
