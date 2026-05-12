@@ -2173,10 +2173,10 @@ mod tests {
             match self.started.lock() {
                 Ok(mut started) => started.push(command),
                 Err(_) => {
-                    return Err(
-                        error::ErrorKind::Unimplemented("recording runtime mutex poisoned")
-                            .into(),
-                    );
+                    return Err(error::ErrorKind::Unimplemented(
+                        "recording runtime mutex poisoned",
+                    )
+                    .into());
                 }
             }
             Ok(commands::BackgroundJobStart {
@@ -2219,7 +2219,10 @@ mod tests {
             .run_string("hello world &", &SourceInfo::from("test"), &params)
             .await?;
 
-        anyhow::ensure!(result.is_success(), "expected background command to succeed");
+        anyhow::ensure!(
+            result.is_success(),
+            "expected background command to succeed"
+        );
         let started = {
             let guard = runtime
                 .started
@@ -2228,10 +2231,11 @@ mod tests {
             guard.clone()
         };
         anyhow::ensure!(
-            started == vec![commands::PreparedSimpleCommand {
-                command_name: "hello".to_string(),
-                argv: vec!["hello".to_string(), "world".to_string()],
-            }],
+            started
+                == vec![commands::PreparedSimpleCommand {
+                    command_name: "hello".to_string(),
+                    argv: vec!["hello".to_string(), "world".to_string()],
+                }],
             "unexpected recorded background command"
         );
         anyhow::ensure!(shell.jobs().jobs.is_empty(), "expected no shell jobs");
