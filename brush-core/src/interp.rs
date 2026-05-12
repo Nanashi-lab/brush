@@ -2121,6 +2121,26 @@ fn setup_process_substitution(
     Ok((candidate_fd_num, target_file))
 }
 
+fn setup_open_file_with_contents(contents: &str) -> Result<OpenFile, error::Error> {
+    let (reader, mut writer) = std::io::pipe()?;
+
+    let bytes = contents.as_bytes();
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::AsFd as _;
+
+        let len = i32::try_from(bytes.len())
+            .map_err(|_err| error::Error::from(error::ErrorKind::TooMuchData))?;
+        nix::fcntl::fcntl(reader.as_fd(), nix::fcntl::FcntlArg::F_SETPIPE_SZ(len))?;
+    }
+
+    writer.write_all(bytes)?;
+    drop(writer);
+
+    Ok(reader.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2150,10 +2170,15 @@ mod tests {
             _params: &ExecutionParameters,
             command: commands::PreparedSimpleCommand,
         ) -> std::result::Result<commands::BackgroundJobStart, error::Error> {
-            self.started
-                .lock()
-                .expect("recording runtime mutex poisoned")
-                .push(command);
+            match self.started.lock() {
+                Ok(mut started) => started.push(command),
+                Err(_) => {
+                    return Err(
+                        error::ErrorKind::Unimplemented("recording runtime mutex poisoned")
+                            .into(),
+                    );
+                }
+            }
             Ok(commands::BackgroundJobStart {
                 result: ExecutionResult::success(),
                 display: None,
@@ -2194,18 +2219,22 @@ mod tests {
             .run_string("hello world &", &SourceInfo::from("test"), &params)
             .await?;
 
-        assert!(result.is_success());
-        assert_eq!(
-            *runtime
+        anyhow::ensure!(result.is_success(), "expected background command to succeed");
+        let started = {
+            let guard = runtime
                 .started
                 .lock()
-                .expect("recording runtime mutex poisoned"),
-            vec![commands::PreparedSimpleCommand {
+                .map_err(|_| anyhow::anyhow!("recording runtime mutex poisoned"))?;
+            guard.clone()
+        };
+        anyhow::ensure!(
+            started == vec![commands::PreparedSimpleCommand {
                 command_name: "hello".to_string(),
                 argv: vec!["hello".to_string(), "world".to_string()],
-            }]
+            }],
+            "unexpected recorded background command"
         );
-        assert!(shell.jobs().jobs.is_empty());
+        anyhow::ensure!(shell.jobs().jobs.is_empty(), "expected no shell jobs");
 
         Ok(())
     }
@@ -2221,36 +2250,17 @@ mod tests {
             .run_string("one | two &", &SourceInfo::from("test"), &params)
             .await?;
 
-        assert_eq!(u8::from(result.exit_code), 99);
-        assert!(
-            runtime
+        anyhow::ensure!(u8::from(result.exit_code) == 99, "unexpected exit code");
+        let started_is_empty = {
+            let guard = runtime
                 .started
                 .lock()
-                .expect("recording runtime mutex poisoned")
-                .is_empty()
-        );
-        assert!(shell.jobs().jobs.is_empty());
+                .map_err(|_| anyhow::anyhow!("recording runtime mutex poisoned"))?;
+            guard.is_empty()
+        };
+        anyhow::ensure!(started_is_empty, "expected runtime not to start jobs");
+        anyhow::ensure!(shell.jobs().jobs.is_empty(), "expected no shell jobs");
 
         Ok(())
     }
-}
-
-fn setup_open_file_with_contents(contents: &str) -> Result<OpenFile, error::Error> {
-    let (reader, mut writer) = std::io::pipe()?;
-
-    let bytes = contents.as_bytes();
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        use std::os::fd::AsFd as _;
-
-        let len = i32::try_from(bytes.len())
-            .map_err(|_err| error::Error::from(error::ErrorKind::TooMuchData))?;
-        nix::fcntl::fcntl(reader.as_fd(), nix::fcntl::FcntlArg::F_SETPIPE_SZ(len))?;
-    }
-
-    writer.write_all(bytes)?;
-    drop(writer);
-
-    Ok(reader.into())
 }
