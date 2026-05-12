@@ -112,11 +112,21 @@ struct MemoryPipeReader {
 
 impl std::io::Read for MemoryPipeReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let mut buffer = self.buffer.lock().expect("memory pipe mutex poisoned");
-        let count = buf.len().min(buffer.len());
-        for slot in &mut buf[..count] {
-            *slot = buffer.pop_front().expect("count is capped to buffer len");
-        }
+        let count = {
+            let mut buffer = self
+                .buffer
+                .lock()
+                .map_err(|_| std::io::Error::other("memory pipe mutex poisoned"))?;
+            let count = buf.len().min(buffer.len());
+            for slot in &mut buf[..count] {
+                if let Some(byte) = buffer.pop_front() {
+                    *slot = byte;
+                } else {
+                    break;
+                }
+            }
+            count
+        };
         Ok(count)
     }
 }
@@ -162,7 +172,7 @@ impl std::io::Write for MemoryPipeWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.buffer
             .lock()
-            .expect("memory pipe mutex poisoned")
+            .map_err(|_| std::io::Error::other("memory pipe mutex poisoned"))?
             .extend(buf);
         Ok(buf.len())
     }

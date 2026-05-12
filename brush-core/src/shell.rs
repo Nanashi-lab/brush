@@ -124,13 +124,9 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     builtins: HashMap<String, builtins::Registration<SE>>,
 
-    /// Optional runtime that handles external command execution.
+    /// Optional embedded runtime owner for stateful command execution.
     #[cfg_attr(feature = "serde", serde(skip))]
-    external_command_runtime: Option<Arc<dyn commands::ExternalCommandRuntime<SE>>>,
-
-    /// Optional runtime that handles files opened by redirection syntax.
-    #[cfg_attr(feature = "serde", serde(skip))]
-    redirection_runtime: Option<Arc<dyn commands::RedirectionRuntime<SE>>>,
+    execution_runtime: Option<Arc<dyn commands::ExecutionRuntime<SE>>>,
 
     /// Shell program location cache.
     program_location_cache: pathcache::PathCache,
@@ -183,8 +179,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             directory_stack: self.directory_stack.clone(),
             completion_config: self.completion_config.clone(),
             builtins: self.builtins.clone(),
-            external_command_runtime: self.external_command_runtime.clone(),
-            redirection_runtime: self.redirection_runtime.clone(),
+            execution_runtime: self.execution_runtime.clone(),
             program_location_cache: self.program_location_cache.clone(),
             last_stopwatch_time: self.last_stopwatch_time,
             last_stopwatch_offset: self.last_stopwatch_offset,
@@ -209,30 +204,16 @@ impl<SE: extensions::ShellExtensions> AsMut<Self> for Shell<SE> {
 }
 
 impl<SE: extensions::ShellExtensions> Shell<SE> {
-    /// Sets the runtime used for external command execution.
-    pub fn set_external_command_runtime(
+    /// Sets the embedded runtime used for stateful execution behavior.
+    pub fn set_execution_runtime(
         &mut self,
-        runtime: Option<Arc<dyn commands::ExternalCommandRuntime<SE>>>,
+        runtime: Option<Arc<dyn commands::ExecutionRuntime<SE>>>,
     ) {
-        self.external_command_runtime = runtime;
+        self.execution_runtime = runtime;
     }
 
-    pub(crate) fn external_command_runtime(
-        &self,
-    ) -> Option<Arc<dyn commands::ExternalCommandRuntime<SE>>> {
-        self.external_command_runtime.clone()
-    }
-
-    /// Sets the runtime used for redirection file opening.
-    pub fn set_redirection_runtime(
-        &mut self,
-        runtime: Option<Arc<dyn commands::RedirectionRuntime<SE>>>,
-    ) {
-        self.redirection_runtime = runtime;
-    }
-
-    pub(crate) fn redirection_runtime(&self) -> Option<Arc<dyn commands::RedirectionRuntime<SE>>> {
-        self.redirection_runtime.clone()
+    pub(crate) fn execution_runtime(&self) -> Option<Arc<dyn commands::ExecutionRuntime<SE>>> {
+        self.execution_runtime.clone()
     }
 
     /// Returns a new shell instance created with the given options.

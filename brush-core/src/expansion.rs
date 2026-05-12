@@ -1825,6 +1825,12 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
                 Expansion::from(std::process::id().to_string())
             }
             brush_parser::word::SpecialParameter::LastBackgroundProcessId => {
+                if let Some(runtime) = self.shell.execution_runtime() {
+                    return Expansion::from(
+                        runtime.last_background_pid(self.shell).unwrap_or_default(),
+                    );
+                }
+
                 if let Some(job) = self.shell.jobs().current_job()
                     && let Some(pid) = job.representative_pid()
                 {
@@ -2102,6 +2108,53 @@ fn may_contain_braces_to_expand(s: &str) -> bool {
 mod tests {
     use super::*;
     use anyhow::Result;
+    use std::sync::Arc;
+
+    struct LastBackgroundPidRuntime {
+        pid: String,
+    }
+
+    impl crate::commands::ExecutionRuntime for LastBackgroundPidRuntime {
+        fn execute_simple_command(
+            &self,
+            _context: crate::ExecutionContext<'_>,
+            _argv0_override: Option<&str>,
+            _args: Vec<crate::CommandArg>,
+        ) -> std::result::Result<crate::ExecutionSpawnResult, crate::error::Error> {
+            Err(crate::ErrorKind::Unimplemented("test runtime does not execute commands").into())
+        }
+
+        fn start_background_job(
+            &self,
+            _shell: &mut crate::Shell,
+            _params: &crate::ExecutionParameters,
+            _command: crate::commands::PreparedSimpleCommand,
+        ) -> std::result::Result<crate::commands::BackgroundJobStart, crate::error::Error> {
+            Err(crate::ErrorKind::Unimplemented("test runtime does not start jobs").into())
+        }
+
+        fn last_background_pid(&self, _shell: &crate::Shell) -> Option<String> {
+            Some(self.pid.clone())
+        }
+
+        fn check_for_completed_jobs(
+            &self,
+            _shell: &mut crate::Shell,
+            _output: &mut dyn std::io::Write,
+        ) -> std::result::Result<(), crate::error::Error> {
+            Ok(())
+        }
+
+        fn open_redirection(
+            &self,
+            _shell: &crate::Shell,
+            _params: &crate::ExecutionParameters,
+            _path: &std::path::Path,
+            _mode: crate::commands::RedirectionOpenMode,
+        ) -> std::result::Result<crate::openfiles::OpenFile, crate::error::Error> {
+            Err(crate::ErrorKind::Unimplemented("test runtime does not open files").into())
+        }
+    }
 
     #[tokio::test]
     async fn test_full_expansion() -> Result<()> {
@@ -2204,6 +2257,22 @@ mod tests {
                 WordField(vec![ExpansionPiece::Unsplittable(String::from("A"))]),
                 WordField(vec![ExpansionPiece::Unsplittable(String::new())])
             ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_last_background_pid_uses_installed_runtime() -> Result<()> {
+        let mut shell = crate::shell::Shell::builder().build().await?;
+        shell.set_execution_runtime(Some(Arc::new(LastBackgroundPidRuntime {
+            pid: "42".to_string(),
+        })));
+        let params = shell.default_exec_params();
+
+        assert_eq!(
+            full_expand_and_split_word(&mut shell, &params, "$!").await?,
+            vec!["42"]
         );
 
         Ok(())
