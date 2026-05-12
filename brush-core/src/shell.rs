@@ -8,9 +8,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::{
-    ExecutionControlFlow, ExecutionResult, builtins, env::ShellEnvironment, error, extensions,
-    functions, interfaces, jobs, keywords, openfiles, options::RuntimeOptions, pathcache,
-    wellknownvars,
+    ExecutionControlFlow, ExecutionResult, builtins, commands, env::ShellEnvironment, error,
+    extensions, functions, interfaces, jobs, keywords, openfiles, options::RuntimeOptions,
+    pathcache, wellknownvars,
 };
 
 /// Type for storing a key bindings helper.
@@ -124,6 +124,10 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip))]
     builtins: HashMap<String, builtins::Registration<SE>>,
 
+    /// Optional embedded runtime owner for stateful command execution.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    execution_runtime: Option<Arc<dyn commands::ExecutionRuntime<SE>>>,
+
     /// Shell program location cache.
     program_location_cache: pathcache::PathCache,
 
@@ -175,6 +179,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
             directory_stack: self.directory_stack.clone(),
             completion_config: self.completion_config.clone(),
             builtins: self.builtins.clone(),
+            execution_runtime: self.execution_runtime.clone(),
             program_location_cache: self.program_location_cache.clone(),
             last_stopwatch_time: self.last_stopwatch_time,
             last_stopwatch_offset: self.last_stopwatch_offset,
@@ -199,6 +204,18 @@ impl<SE: extensions::ShellExtensions> AsMut<Self> for Shell<SE> {
 }
 
 impl<SE: extensions::ShellExtensions> Shell<SE> {
+    /// Sets the embedded runtime used for stateful execution behavior.
+    pub fn set_execution_runtime(
+        &mut self,
+        runtime: Option<Arc<dyn commands::ExecutionRuntime<SE>>>,
+    ) {
+        self.execution_runtime = runtime;
+    }
+
+    pub(crate) fn execution_runtime(&self) -> Option<Arc<dyn commands::ExecutionRuntime<SE>>> {
+        self.execution_runtime.clone()
+    }
+
     /// Returns a new shell instance created with the given options.
     /// Does *not* load any configuration files (e.g., bashrc).
     ///

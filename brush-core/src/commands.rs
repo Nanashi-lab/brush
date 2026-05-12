@@ -4,6 +4,7 @@ use std::{
     borrow::Cow,
     ffi::OsStr,
     fmt::Display,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -40,6 +41,80 @@ pub struct ExecutionContext<'a, SE: ShellExtensions = extensions::DefaultShellEx
     pub command_name: String,
     /// The parameters for the execution.
     pub params: ExecutionParameters,
+}
+
+/// Runtime hook for commands that Brush cannot resolve as shell syntax,
+/// functions, or builtins, plus other stateful execution behavior when
+/// Brush is embedded inside a larger runtime owner.
+pub trait ExecutionRuntime<SE: ShellExtensions = extensions::DefaultShellExtensions>:
+    Send + Sync
+{
+    /// Executes a simple command through the installed runtime.
+    fn execute_simple_command(
+        &self,
+        context: ExecutionContext<'_, SE>,
+        argv0_override: Option<&str>,
+        args: Vec<CommandArg>,
+    ) -> Result<ExecutionSpawnResult, error::Error>;
+
+    /// Starts a supported async simple command through the installed runtime.
+    fn start_background_job(
+        &self,
+        shell: &mut Shell<SE>,
+        params: &ExecutionParameters,
+        command: PreparedSimpleCommand,
+    ) -> Result<BackgroundJobStart, error::Error>;
+
+    /// Resolves `$!` through the installed runtime.
+    fn last_background_pid(&self, shell: &Shell<SE>) -> Option<String>;
+
+    /// Polls for any runtime-managed background work and emits any user-visible
+    /// notifications to the provided output.
+    fn check_for_completed_jobs(
+        &self,
+        shell: &mut Shell<SE>,
+        output: &mut dyn Write,
+    ) -> Result<(), error::Error>;
+
+    /// Opens a redirection target. Implementations are responsible for refusing
+    /// unsupported paths or modes without falling back to host filesystem access.
+    fn open_redirection(
+        &self,
+        shell: &Shell<SE>,
+        params: &ExecutionParameters,
+        path: &Path,
+        mode: RedirectionOpenMode,
+    ) -> Result<OpenFile, error::Error>;
+}
+
+/// A simple command prepared by Brush shell-language evaluation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedSimpleCommand {
+    /// The fully expanded command name.
+    pub command_name: String,
+    /// The fully expanded argv, including argv[0].
+    pub argv: Vec<String>,
+}
+
+/// Immediate result of attempting to start a background job.
+pub struct BackgroundJobStart {
+    /// The shell-visible result of the start attempt.
+    pub result: ExecutionResult,
+    /// Optional job display text for interactive shells.
+    pub display: Option<String>,
+}
+
+/// The file access mode requested by a shell redirection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectionOpenMode {
+    /// Open an existing file for reading.
+    Read,
+    /// Create or truncate a file for writing.
+    WriteTruncate,
+    /// Create or append to a file for writing.
+    WriteAppend,
+    /// Open a file for reading and writing.
+    ReadWrite,
 }
 
 impl<SE: ShellExtensions> ExecutionContext<'_, SE> {
@@ -353,6 +428,13 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         reason = "these unwrap calls should not panic"
     )]
     pub async fn execute(mut self) -> Result<ExecutionSpawnResult, error::Error> {
+        // If an external runtime is installed, hand off before doing any Brush
+        // builtin/function dispatch or host PATH/filesystem resolution. This lets
+        // embedders make a single runtime authoritative for command execution.
+        if self.shell.execution_runtime().is_some() {
+            return self.execute_via_runtime();
+        }
+
         // First see if it's the name of a builtin.
         let builtin = self.shell.builtins().get(&self.command_name).cloned();
 
@@ -518,6 +600,34 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         // the invocation (or the function name itself if zero args). Any
         // mutations made inside the body are overwritten — this matches bash,
         // where the caller observes only the invocation's last argument.
+        shell.update_last_arg_variable(last_arg);
+
+        if let Some(post_execute) = self.post_execute {
+            let _ = post_execute(&mut shell);
+        }
+
+        result
+    }
+
+    fn execute_via_runtime(self) -> Result<ExecutionSpawnResult, error::Error> {
+        let mut shell = self.shell;
+        let last_arg = Self::take_last_arg(&self.args);
+
+        let cmd_context = ExecutionContext {
+            shell: &mut shell,
+            command_name: self.command_name,
+            params: self.params,
+        };
+
+        let Some(runtime) = cmd_context.shell.execution_runtime() else {
+            return Err(error::ErrorKind::InternalError(
+                "execution runtime missing during runtime dispatch".into(),
+            )
+            .into());
+        };
+        let result = runtime.execute_simple_command(cmd_context, self.argv0.as_deref(), self.args);
+
+        // Update $_ after command execution.
         shell.update_last_arg_variable(last_arg);
 
         if let Some(post_execute) = self.post_execute {
@@ -767,6 +877,18 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
     // Get our own set of parameters we can customize and use.
     let mut params = params.clone();
     params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
+
+    if shell.execution_runtime().is_some() {
+        let (mut reader, writer) = openfiles::memory_pipe();
+        params.set_fd(OpenFiles::STDOUT_FD, writer);
+
+        let cmd_result = run_substitution_command(subshell, params, s).await?;
+        let mut output_str = String::new();
+        reader.read_to_string(&mut output_str)?;
+
+        shell.set_last_exit_status(cmd_result.exit_code.into());
+        return Ok(output_str);
+    }
 
     // Set up pipe so we can read the output.
     let (reader, writer) = std::io::pipe()?;

@@ -1,8 +1,9 @@
 //! Managing files open within a shell instance.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::IsTerminal;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 
 use crate::ShellFd;
 use crate::error;
@@ -91,6 +92,110 @@ impl<'de> serde::Deserialize<'de> for OpenFile {
 pub fn null() -> Result<OpenFile, error::Error> {
     let file = sys::fs::open_null_file()?;
     Ok(OpenFile::File(file))
+}
+
+/// Returns an in-memory pipe backed by Brush streams.
+pub(crate) fn memory_pipe() -> (OpenFile, OpenFile) {
+    let buffer = Arc::new(Mutex::new(VecDeque::new()));
+    (
+        OpenFile::Stream(Box::new(MemoryPipeReader {
+            buffer: Arc::clone(&buffer),
+        })),
+        OpenFile::Stream(Box::new(MemoryPipeWriter { buffer })),
+    )
+}
+
+#[derive(Clone)]
+struct MemoryPipeReader {
+    buffer: Arc<Mutex<VecDeque<u8>>>,
+}
+
+impl std::io::Read for MemoryPipeReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let count = {
+            let mut buffer = self
+                .buffer
+                .lock()
+                .map_err(|_| std::io::Error::other("memory pipe mutex poisoned"))?;
+            let count = buf.len().min(buffer.len());
+            for slot in &mut buf[..count] {
+                if let Some(byte) = buffer.pop_front() {
+                    *slot = byte;
+                } else {
+                    break;
+                }
+            }
+            count
+        };
+        Ok(count)
+    }
+}
+
+impl std::io::Write for MemoryPipeReader {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("memory pipe reader is not writable"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Stream for MemoryPipeReader {
+    fn clone_box(&self) -> Box<dyn Stream> {
+        Box::new(self.clone())
+    }
+
+    #[cfg(unix)]
+    fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, error::Error> {
+        Err(error::ErrorKind::CannotConvertToNativeFd.into())
+    }
+
+    #[cfg(unix)]
+    fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, error::Error> {
+        Err(error::ErrorKind::CannotConvertToNativeFd.into())
+    }
+}
+
+#[derive(Clone)]
+struct MemoryPipeWriter {
+    buffer: Arc<Mutex<VecDeque<u8>>>,
+}
+
+impl std::io::Read for MemoryPipeWriter {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("memory pipe writer is not readable"))
+    }
+}
+
+impl std::io::Write for MemoryPipeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer
+            .lock()
+            .map_err(|_| std::io::Error::other("memory pipe mutex poisoned"))?
+            .extend(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Stream for MemoryPipeWriter {
+    fn clone_box(&self) -> Box<dyn Stream> {
+        Box::new(self.clone())
+    }
+
+    #[cfg(unix)]
+    fn try_clone_to_owned(&self) -> Result<std::os::fd::OwnedFd, error::Error> {
+        Err(error::ErrorKind::CannotConvertToNativeFd.into())
+    }
+
+    #[cfg(unix)]
+    fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, error::Error> {
+        Err(error::ErrorKind::CannotConvertToNativeFd.into())
+    }
 }
 
 impl Clone for OpenFile {

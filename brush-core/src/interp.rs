@@ -248,20 +248,30 @@ impl Execute for ast::CompoundList {
             let run_async = matches!(sep, ast::SeparatorOperator::Async);
 
             if run_async {
-                let job = spawn_async_ao_list_in_task(ao_list, shell, params);
-                let job_formatted = job.to_pid_style_string();
+                if shell.execution_runtime().is_some() {
+                    let started = start_async_list_via_runtime(ao_list, shell, params).await?;
+                    if shell.options().interactive
+                        && !shell.is_subshell()
+                        && let Some(display) = started.display
+                    {
+                        writeln!(params.stderr(shell), "{display}")?;
+                    }
+                    result = started.result;
+                } else {
+                    let job = spawn_async_ao_list_in_task(ao_list, shell, params);
+                    let job_formatted = job.to_pid_style_string();
 
-                if shell.options().interactive && !shell.is_subshell() {
-                    writeln!(params.stderr(shell), "{job_formatted}")?;
+                    if shell.options().interactive && !shell.is_subshell() {
+                        writeln!(params.stderr(shell), "{job_formatted}")?;
+                    }
+
+                    result = ExecutionResult::success();
                 }
-
-                result = ExecutionResult::success();
             } else {
                 result = ao_list.execute(shell, params).await?;
-
-                // Update status
-                shell.set_last_exit_status(result.exit_code.into());
             }
+
+            shell.set_last_exit_status(result.exit_code.into());
 
             if !result.is_normal_flow() {
                 break;
@@ -301,6 +311,120 @@ fn spawn_async_ao_list_in_task<'a, SE: extensions::ShellExtensions>(
         ao_list.to_string(),
         jobs::JobState::Running,
     ))
+}
+
+async fn start_async_list_via_runtime<SE: extensions::ShellExtensions>(
+    ao_list: &ast::AndOrList,
+    shell: &mut Shell<SE>,
+    params: &ExecutionParameters,
+) -> Result<commands::BackgroundJobStart, error::Error> {
+    let Some(runtime) = shell.execution_runtime() else {
+        return Err(error::ErrorKind::InternalError(
+            "execution runtime missing during async delegation".into(),
+        )
+        .into());
+    };
+
+    if !ao_list.additional.is_empty() {
+        return Err(error::ErrorKind::Unimplemented(
+            "embedded async execution only supports a single simple command today",
+        )
+        .into());
+    }
+
+    let pipeline = &ao_list.first;
+    if pipeline.bang || pipeline.timed.is_some() || pipeline.seq.len() != 1 {
+        return Err(error::ErrorKind::Unimplemented(
+            "embedded async execution only supports a single simple command today",
+        )
+        .into());
+    }
+
+    let ast::Command::Simple(command) = &pipeline.seq[0] else {
+        return Err(error::ErrorKind::Unimplemented(
+            "embedded async execution only supports a single simple command today",
+        )
+        .into());
+    };
+
+    let command = prepare_simple_command_for_runtime(shell, params, command).await?;
+    runtime.start_background_job(shell, params, command)
+}
+
+async fn prepare_simple_command_for_runtime<SE: extensions::ShellExtensions>(
+    shell: &mut Shell<SE>,
+    params: &ExecutionParameters,
+    command: &ast::SimpleCommand,
+) -> Result<commands::PreparedSimpleCommand, error::Error> {
+    let prefix_iter = command
+        .prefix
+        .as_ref()
+        .map(|s| s.0.iter())
+        .unwrap_or_default();
+    let suffix_iter = command
+        .suffix
+        .as_ref()
+        .map(|s| s.0.iter())
+        .unwrap_or_default();
+    let cmd_name_items = command
+        .word_or_name
+        .as_ref()
+        .map(|won| CommandPrefixOrSuffixItem::Word(won.clone()));
+
+    let mut argv = Vec::new();
+
+    for item in prefix_iter.chain(cmd_name_items.iter()).chain(suffix_iter) {
+        match item {
+            CommandPrefixOrSuffixItem::IoRedirect(..) => {
+                return Err(error::ErrorKind::Unimplemented(
+                    "embedded async execution with redirections is not supported yet",
+                )
+                .into());
+            }
+            CommandPrefixOrSuffixItem::ProcessSubstitution(..) => {
+                return Err(error::ErrorKind::Unimplemented(
+                    "embedded async execution with process substitution is not supported yet",
+                )
+                .into());
+            }
+            CommandPrefixOrSuffixItem::AssignmentWord(..) => {
+                return Err(error::ErrorKind::Unimplemented(
+                    "embedded async execution with command-scoped assignments is not supported yet",
+                )
+                .into());
+            }
+            CommandPrefixOrSuffixItem::Word(word) => {
+                let mut next_args =
+                    expansion::full_expand_and_split_word(shell, params, word).await?;
+
+                if argv.is_empty() {
+                    if let Some(cmd_name) = next_args.first()
+                        && let Some(alias_value) = shell.aliases().get(cmd_name.as_str())
+                    {
+                        let mut alias_pieces: Vec<_> = alias_value
+                            .split_ascii_whitespace()
+                            .map(|piece| piece.to_owned())
+                            .collect();
+
+                        next_args.remove(0);
+                        alias_pieces.append(&mut next_args);
+                        next_args = alias_pieces;
+                    }
+                }
+
+                argv.append(&mut next_args);
+            }
+        }
+    }
+
+    let Some(command_name) = argv.first().cloned() else {
+        return Err(error::ErrorKind::Unimplemented(
+            "embedded async execution requires a simple command",
+        )
+        .into());
+    };
+
+    Ok(commands::PreparedSimpleCommand { command_name, argv })
 }
 
 #[async_trait::async_trait]
@@ -457,9 +581,14 @@ async fn spawn_pipeline_processes(
     // command.
     if pipeline_len > 1 {
         for _ in 0..(pipeline_len - 1) {
-            let (reader, writer) = std::io::pipe()?;
-            pipe_readers.push(Some(reader.into()));
-            pipe_writers.push(Some(writer.into()));
+            let (reader, writer) = if shell.execution_runtime().is_some() {
+                openfiles::memory_pipe()
+            } else {
+                let (reader, writer) = std::io::pipe()?;
+                (reader.into(), writer.into())
+            };
+            pipe_readers.push(Some(reader));
+            pipe_writers.push(Some(writer));
         }
         // Push `None` to the readers; it will be popped off by the *first* command, which will
         // mean that command gets its stdin from the execution parameters' current stdin.
@@ -1660,9 +1789,10 @@ pub(crate) async fn setup_redirect(
                         shell.absolute_path(Path::new(expanded_fields.remove(0).as_str()));
 
                     let default_fd_if_unspecified = get_default_fd_for_redirect_kind(kind);
-                    match kind {
+                    let redirection_mode = match kind {
                         ast::IoFileRedirectKind::Read => {
                             options.read(true);
+                            commands::RedirectionOpenMode::Read
                         }
                         ast::IoFileRedirectKind::Write => {
                             if shell
@@ -1682,40 +1812,45 @@ pub(crate) async fn setup_redirect(
                                 options.write(true);
                                 options.truncate(true);
                             }
+                            commands::RedirectionOpenMode::WriteTruncate
                         }
                         ast::IoFileRedirectKind::Append => {
                             options.create(true);
                             options.append(true);
+                            commands::RedirectionOpenMode::WriteAppend
                         }
                         ast::IoFileRedirectKind::ReadAndWrite => {
                             options.create(true);
                             options.read(true);
                             options.write(true);
+                            commands::RedirectionOpenMode::ReadWrite
                         }
                         ast::IoFileRedirectKind::Clobber => {
                             options.create(true);
                             options.write(true);
                             options.truncate(true);
+                            commands::RedirectionOpenMode::WriteTruncate
                         }
                         ast::IoFileRedirectKind::DuplicateInput => {
                             options.read(true);
+                            commands::RedirectionOpenMode::Read
                         }
                         ast::IoFileRedirectKind::DuplicateOutput => {
                             options.create(true);
                             options.write(true);
+                            commands::RedirectionOpenMode::WriteTruncate
                         }
-                    }
+                    };
 
                     let fd_num = specified_fd_num.unwrap_or(default_fd_if_unspecified);
 
-                    let opened_file = shell
-                        .open_file(&options, &expanded_file_path, params)
-                        .map_err(|err| {
-                            error::ErrorKind::RedirectionFailure(
-                                expanded_file_path.to_string_lossy().to_string(),
-                                err.to_string(),
-                            )
-                        })?;
+                    let opened_file = open_redirection_file(
+                        shell,
+                        params,
+                        &options,
+                        &expanded_file_path,
+                        redirection_mode,
+                    )?;
 
                     params.open_files.set_fd(fd_num, opened_file);
                 }
@@ -1881,14 +2016,12 @@ fn setup_redirect_output_and_error_to(
         .truncate(!append)
         .append(append);
 
-    let stdout_file = shell
-        .open_file(&file_options, &abs_file_path, params)
-        .map_err(|err| {
-            error::ErrorKind::RedirectionFailure(
-                abs_file_path.to_string_lossy().to_string(),
-                err.to_string(),
-            )
-        })?;
+    let mode = if append {
+        commands::RedirectionOpenMode::WriteAppend
+    } else {
+        commands::RedirectionOpenMode::WriteTruncate
+    };
+    let stdout_file = open_redirection_file(shell, params, &file_options, &abs_file_path, mode)?;
 
     let stderr_file = stdout_file.try_clone()?;
 
@@ -1896,6 +2029,31 @@ fn setup_redirect_output_and_error_to(
     params.open_files.set_fd(OpenFiles::STDERR_FD, stderr_file);
 
     Ok(())
+}
+
+fn open_redirection_file(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    options: &std::fs::OpenOptions,
+    path: &Path,
+    mode: commands::RedirectionOpenMode,
+) -> Result<OpenFile, error::Error> {
+    if let Some(runtime) = shell.execution_runtime() {
+        return runtime
+            .open_redirection(shell, params, path, mode)
+            .map_err(|err| {
+                error::ErrorKind::RedirectionFailure(
+                    path.to_string_lossy().to_string(),
+                    err.to_string(),
+                )
+                .into()
+            });
+    }
+
+    shell.open_file(options, path, params).map_err(|err| {
+        error::ErrorKind::RedirectionFailure(path.to_string_lossy().to_string(), err.to_string())
+            .into()
+    })
 }
 
 const fn get_default_fd_for_redirect_kind(kind: &ast::IoFileRedirectKind) -> ShellFd {
@@ -1981,4 +2139,132 @@ fn setup_open_file_with_contents(contents: &str) -> Result<OpenFile, error::Erro
     drop(writer);
 
     Ok(reader.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use std::sync::{Arc, Mutex};
+
+    use crate::SourceInfo;
+
+    #[derive(Default)]
+    struct RecordingRuntime {
+        started: Mutex<Vec<commands::PreparedSimpleCommand>>,
+    }
+
+    impl commands::ExecutionRuntime for RecordingRuntime {
+        fn execute_simple_command(
+            &self,
+            _context: commands::ExecutionContext<'_>,
+            _argv0_override: Option<&str>,
+            _args: Vec<commands::CommandArg>,
+        ) -> std::result::Result<ExecutionSpawnResult, error::Error> {
+            Err(error::ErrorKind::Unimplemented("test runtime does not execute commands").into())
+        }
+
+        fn start_background_job(
+            &self,
+            _shell: &mut Shell,
+            _params: &ExecutionParameters,
+            command: commands::PreparedSimpleCommand,
+        ) -> std::result::Result<commands::BackgroundJobStart, error::Error> {
+            match self.started.lock() {
+                Ok(mut started) => started.push(command),
+                Err(_) => {
+                    return Err(error::ErrorKind::Unimplemented(
+                        "recording runtime mutex poisoned",
+                    )
+                    .into());
+                }
+            }
+            Ok(commands::BackgroundJobStart {
+                result: ExecutionResult::success(),
+                display: None,
+            })
+        }
+
+        fn last_background_pid(&self, _shell: &Shell) -> Option<String> {
+            None
+        }
+
+        fn check_for_completed_jobs(
+            &self,
+            _shell: &mut Shell,
+            _output: &mut dyn Write,
+        ) -> std::result::Result<(), error::Error> {
+            Ok(())
+        }
+
+        fn open_redirection(
+            &self,
+            _shell: &Shell,
+            _params: &ExecutionParameters,
+            _path: &Path,
+            _mode: commands::RedirectionOpenMode,
+        ) -> std::result::Result<OpenFile, error::Error> {
+            Err(error::ErrorKind::Unimplemented("test runtime does not open files").into())
+        }
+    }
+
+    #[tokio::test]
+    async fn async_simple_command_delegates_to_installed_runtime() -> Result<()> {
+        let runtime = Arc::new(RecordingRuntime::default());
+        let mut shell = Shell::builder().build().await?;
+        shell.set_execution_runtime(Some(runtime.clone()));
+        let params = shell.default_exec_params();
+
+        let result = shell
+            .run_string("hello world &", &SourceInfo::from("test"), &params)
+            .await?;
+
+        anyhow::ensure!(
+            result.is_success(),
+            "expected background command to succeed"
+        );
+        let started = {
+            let guard = runtime
+                .started
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recording runtime mutex poisoned"))?;
+            guard.clone()
+        };
+        anyhow::ensure!(
+            started
+                == vec![commands::PreparedSimpleCommand {
+                    command_name: "hello".to_string(),
+                    argv: vec!["hello".to_string(), "world".to_string()],
+                }],
+            "unexpected recorded background command"
+        );
+        anyhow::ensure!(shell.jobs().jobs.is_empty(), "expected no shell jobs");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unsupported_async_pipeline_does_not_fall_back_to_brush_jobs() -> Result<()> {
+        let runtime = Arc::new(RecordingRuntime::default());
+        let mut shell = Shell::builder().build().await?;
+        shell.set_execution_runtime(Some(runtime.clone()));
+        let params = shell.default_exec_params();
+
+        let result = shell
+            .run_string("one | two &", &SourceInfo::from("test"), &params)
+            .await?;
+
+        anyhow::ensure!(u8::from(result.exit_code) == 99, "unexpected exit code");
+        let started_is_empty = {
+            let guard = runtime
+                .started
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recording runtime mutex poisoned"))?;
+            guard.is_empty()
+        };
+        anyhow::ensure!(started_is_empty, "expected runtime not to start jobs");
+        anyhow::ensure!(shell.jobs().jobs.is_empty(), "expected no shell jobs");
+
+        Ok(())
+    }
 }
